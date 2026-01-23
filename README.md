@@ -1,6 +1,6 @@
 # Hackpad (Hack Club)
 
-A compact, four-key Hackpad built around the Seeed XIAO RP2040 and SK6812 Mini LEDs. This project focuses on a clean, minimal layout with a simple 1u key grid and a snug, layered case.
+A compact, four-key Hackpad built around the Seeed XIAO RP2040 with six SK6812 Mini(-E) addressable RGB LEDs and an optional I²C OLED (SSD1306). The project focuses on a clean, minimal layout with a simple 1u key grid, under-key RGB lighting, and a snug, layered case.
 
 ## Screenshots
 
