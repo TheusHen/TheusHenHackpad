@@ -14,24 +14,37 @@ from kmk.modules.combos import Combos, Chord
 from kmk.modules.oneshot import OneShot
 
 
+# ----------------------------
+# Pin helpers (XIAO RP2040)
+# ----------------------------
 def pin(*names):
+    """Return the first pin name that exists on this CircuitPython board."""
     for n in names:
         if hasattr(board, n):
             return getattr(board, n)
     raise AttributeError("Pin não encontrado: " + ", ".join(names))
 
-PIN_SW1 = pin("GP3", "D3")  # Tab/Super (top-left)
-PIN_SW2 = pin("GP4", "D4")  # X/C (top-right)
-PIN_SW3 = pin("GP2", "D2")  # Alt/Ctrl (bottom-left)
-PIN_SW4 = pin("GP1", "D1")  # PrtSc/V (bottom-right)
 
+# Switches (per schematic):
+# SW1 -> GPIO3, SW2 -> GPIO4, SW3 -> GPIO2, SW4 -> GPIO1
+PIN_SW1 = pin("GP3", "D3")
+PIN_SW2 = pin("GP4", "D4")
+PIN_SW3 = pin("GP2", "D2")
+PIN_SW4 = pin("GP1", "D1")
+
+# NOTE: KeysScanner uses list order as the key coordinate (0..n-1).
+# This order matches your original behavior:
+#   coord 0 = SW1 (top-left)
+#   coord 1 = SW3 (bottom-left)
+#   coord 2 = SW2 (top-right)
+#   coord 3 = SW4 (bottom-right)
 PINS = [PIN_SW1, PIN_SW3, PIN_SW2, PIN_SW4]
 
-# --- LEDs (SK6812MINI-E) - DATA no GPIO0/TX (pino 7 do XIAO)
+# LEDs (SK6812MINI-E) - DATA on GPIO0/TX (pin 7 on XIAO)
 PIXEL_PIN = pin("GP0", "D0", "TX")
 NUM_PIXELS = 6
 
-# --- OLED I2C
+# OLED I2C
 I2C_SDA = pin("GP6", "D6")
 I2C_SCL = pin("GP7", "D7")
 OLED_ADDR = 0x3C
@@ -40,21 +53,30 @@ OLED_H = 32
 
 
 def kc_print_screen():
+    """Best-effort PrintScreen keycode across KMK builds."""
     if hasattr(KC, "PSCR"):
         return KC.PSCR
     if hasattr(KC, "PRINT_SCREEN"):
         return KC.PRINT_SCREEN
-    return KC.PSCR
+    # Fallback: don't crash firmware if a build lacks PrintScreen.
+    return KC.NO
 
 
-# --- Keycodes custom para controlar LEDs
+# Custom keycodes to control LEDs via combos
 BL_NEXT = make_key(names=("BL_NEXT",))
 BL_EFF = make_key(names=("BL_EFF",))
 BL_BRI = make_key(names=("BL_BRI",))
 
 
 class BacklightFX(Module):
-    """Temas/efeitos para 6 NeoPixels + reação por tecla."""
+    """
+    Themes/effects for 6 NeoPixels + key-react flashes.
+
+    IMPORTANT (matches the schematic):
+      Data enters D1 first, then D2..D6.
+      Pixel indices therefore map as:
+        0=D1, 1=D2, 2=D3, 3=D4, 4=D5, 5=D6
+    """
 
     def __init__(self, pixel_pin, n):
         self.pixels = neopixel.NeoPixel(
@@ -65,23 +87,28 @@ class BacklightFX(Module):
             pixel_order=neopixel.GRB,
         )
 
-
+        # Map from key coordinate (int_coord) -> pixel index
+        # Coordinates come from PINS order above.
         self.under_keys = {
-            0: 5,  # SW1 -> D1
-            1: 4,  # SW3 -> D2
-            2: 3,  # SW2 -> D3
-            3: 2,  # SW4 -> D4
+            0: 0,  # SW1 -> D1
+            1: 2,  # SW3 -> D3
+            2: 1,  # SW2 -> D2
+            3: 3,  # SW4 -> D4
         }
-        self.top_pixels = (0, 1)  # D6 e D5
+        self.top_pixels = (4, 5)  # D5 and D6
 
         self.theme_i = 0
         self.effect_i = 0
         self.bri_i = 0
         self.brightness_steps = [0.06, 0.12, 0.20]
 
+        # flash_end_time per pixel
         self.flash = [0.0] * n
+
         self._last_anim = 0.0
         self._anim_t = 0
+        self._dirty = True
+        self.active_layer = 0
 
         self.themes = [
             # (under_key_color, top_color_layer0, top_color_layer1)
@@ -92,18 +119,23 @@ class BacklightFX(Module):
             ((18, 18, 18), (10, 10, 10), (0, 10, 0)), # Branco suave / Verde layer1
         ]
 
-        self.effects = ["static", "breathe", "rainbow"]
-
-        self.active_layer = 0
+        self.effects = ("static", "breathe", "rainbow")
 
     def name(self):
         return "BacklightFX"
 
-    def set_layer(self, layer):
-        self.active_layer = layer
+    # ---- helpers ----
+    def _active_layer_from_keyboard(self, keyboard):
+        if getattr(keyboard, "active_layers", None):
+            return keyboard.active_layers[0]
+        st = getattr(keyboard, "_state", None)
+        if st and getattr(st, "active_layers", None):
+            return st.active_layers[0]
+        return 0
 
-    def _wheel(self, pos):
-        pos = pos % 256
+    @staticmethod
+    def _wheel(pos):
+        pos = pos & 0xFF
         if pos < 85:
             return (pos * 3, 255 - pos * 3, 0)
         if pos < 170:
@@ -112,19 +144,26 @@ class BacklightFX(Module):
         pos -= 170
         return (0, pos * 3, 255 - pos * 3)
 
+    @staticmethod
+    def _scale(c, k):
+        return (int(c[0] * k), int(c[1] * k), int(c[2] * k))
+
+    def _any_flash_active(self, now):
+        for t_end in self.flash:
+            if now < t_end:
+                return True
+        return False
+
+    # ---- renderers ----
     def _apply_static(self):
         under, top0, top1 = self.themes[self.theme_i]
         top = top0 if self.active_layer == 0 else top1
 
         self.pixels.fill((0, 0, 0))
-        for i in range(self.pixels.n):
-            self.pixels[i] = (0, 0, 0)
-
         for i in self.top_pixels:
             if i < self.pixels.n:
                 self.pixels[i] = top
-
-        for _, px in self.under_keys.items():
+        for px in self.under_keys.values():
             if px < self.pixels.n:
                 self.pixels[px] = under
 
@@ -133,21 +172,15 @@ class BacklightFX(Module):
         top = top0 if self.active_layer == 0 else top1
 
         phase = (self._anim_t % 80) / 79.0
-        if phase < 0.5:
-            k = phase * 2.0
-        else:
-            k = (1.0 - phase) * 2.0
-
-        def scale(c):
-            return (int(c[0] * k), int(c[1] * k), int(c[2] * k))
+        k = phase * 2.0 if phase < 0.5 else (1.0 - phase) * 2.0
 
         self.pixels.fill((0, 0, 0))
         for i in self.top_pixels:
             if i < self.pixels.n:
-                self.pixels[i] = scale(top)
-        for _, px in self.under_keys.items():
+                self.pixels[i] = self._scale(top, k)
+        for px in self.under_keys.values():
             if px < self.pixels.n:
-                self.pixels[px] = scale(under)
+                self.pixels[px] = self._scale(under, k)
 
     def _apply_rainbow(self):
         self.pixels.fill((0, 0, 0))
@@ -155,23 +188,28 @@ class BacklightFX(Module):
         for i in range(self.pixels.n):
             self.pixels[i] = self._wheel(base + i * 20)
 
-    def _apply_flash(self):
-        now = time.monotonic()
+    def _apply_flash(self, now):
         for i in range(self.pixels.n):
             if now < self.flash[i]:
                 self.pixels[i] = (40, 40, 40)
 
-    def _render(self):
-        if self.effects[self.effect_i] == "static":
+    def _render(self, now=None):
+        if now is None:
+            now = time.monotonic()
+
+        eff = self.effects[self.effect_i]
+        if eff == "static":
             self._apply_static()
-        elif self.effects[self.effect_i] == "breathe":
+        elif eff == "breathe":
             self._apply_breathe()
         else:
             self._apply_rainbow()
 
-        self._apply_flash()
+        self._apply_flash(now)
         self.pixels.show()
+        self._dirty = False
 
+    # ---- KMK hooks ----
     def during_bootup(self, keyboard):
         self.pixels.brightness = self.brightness_steps[self.bri_i]
         self._render()
@@ -180,43 +218,51 @@ class BacklightFX(Module):
         return
 
     def after_matrix_scan(self, keyboard):
-        layer = 0
-        if hasattr(keyboard, "active_layers") and keyboard.active_layers:
-            layer = keyboard.active_layers[0]
-        elif hasattr(keyboard, "_state") and keyboard._state and keyboard._state.active_layers:
-            layer = keyboard._state.active_layers[0]
-
+        layer = self._active_layer_from_keyboard(keyboard)
         if layer != self.active_layer:
             self.active_layer = layer
+            self._dirty = True
 
         now = time.monotonic()
-        if now - self._last_anim > 0.04:
+
+        eff = self.effects[self.effect_i]
+        wants_anim = eff in ("breathe", "rainbow")
+        has_flash = self._any_flash_active(now)
+
+        if not wants_anim and not has_flash and not self._dirty:
+            return
+
+        if self._dirty or (now - self._last_anim) > 0.04:
             self._last_anim = now
-            self._anim_t += 1
-            self._render()
+            if wants_anim:
+                self._anim_t += 1
+            self._render(now=now)
 
     def process_key(self, keyboard, key, is_pressed, int_coord):
-        if is_pressed:
-            if int_coord is not None:
-                px = self.under_keys.get(int_coord, None)
-                if px is not None and px < self.pixels.n:
-                    self.flash[px] = time.monotonic() + 0.08
+        if not is_pressed:
+            return key
 
-            if key == BL_NEXT:
-                self.theme_i = (self.theme_i + 1) % len(self.themes)
-                self._render()
-                return KC.NO
+        if int_coord is not None:
+            px = self.under_keys.get(int_coord)
+            if px is not None and px < self.pixels.n:
+                self.flash[px] = time.monotonic() + 0.08
+                self._dirty = True
 
-            if key == BL_EFF:
-                self.effect_i = (self.effect_i + 1) % len(self.effects)
-                self._render()
-                return KC.NO
+        if key == BL_NEXT:
+            self.theme_i = (self.theme_i + 1) % len(self.themes)
+            self._dirty = True
+            return KC.NO
 
-            if key == BL_BRI:
-                self.bri_i = (self.bri_i + 1) % len(self.brightness_steps)
-                self.pixels.brightness = self.brightness_steps[self.bri_i]
-                self._render()
-                return KC.NO
+        if key == BL_EFF:
+            self.effect_i = (self.effect_i + 1) % len(self.effects)
+            self._dirty = True
+            return KC.NO
+
+        if key == BL_BRI:
+            self.bri_i = (self.bri_i + 1) % len(self.brightness_steps)
+            self.pixels.brightness = self.brightness_steps[self.bri_i]
+            self._dirty = True
+            return KC.NO
 
         return key
 
@@ -230,7 +276,15 @@ class BacklightFX(Module):
 
 
 class OLEDStatus(Module):
-    """OLED status: nome, layer, tema/efeito/brilho, última tecla."""
+    """
+    OLED status:
+      - name
+      - layer/mode
+      - backlight (theme/effect/brightness)
+      - last key
+
+    Works with 128x32 by using 4 lines (8px each).
+    """
 
     def __init__(self, sda, scl, addr=0x3C, w=128, h=32, bl=None):
         self.sda = sda
@@ -243,6 +297,7 @@ class OLEDStatus(Module):
         self.oled = None
         self.last_key = "-"
         self._last_draw = 0.0
+        self._last_state = None
 
     def _init_oled(self):
         try:
@@ -252,69 +307,80 @@ class OLEDStatus(Module):
 
         try:
             i2c = busio.I2C(self.scl, self.sda)
+            t0 = time.monotonic()
             while not i2c.try_lock():
-                pass
+                if (time.monotonic() - t0) > 0.5:
+                    return
             i2c.unlock()
         except Exception:
             return
 
         try:
-            self.oled = adafruit_ssd1306.SSD1306_I2C(
-                self.w, self.h, i2c, addr=self.addr
-            )
+            self.oled = adafruit_ssd1306.SSD1306_I2C(self.w, self.h, i2c, addr=self.addr)
             self.oled.fill(0)
             self.oled.show()
         except Exception:
             self.oled = None
 
+    @staticmethod
+    def _active_layer_from_keyboard(keyboard):
+        if getattr(keyboard, "active_layers", None):
+            return keyboard.active_layers[0]
+        st = getattr(keyboard, "_state", None)
+        if st and getattr(st, "active_layers", None):
+            return st.active_layers[0]
+        return 0
+
     def during_bootup(self, keyboard):
         self._init_oled()
-        self._draw(force=True)
+        self._draw(keyboard, force=True)
 
     def before_matrix_scan(self, keyboard):
         return
 
     def after_matrix_scan(self, keyboard):
-        self._draw()
+        self._draw(keyboard)
 
     def process_key(self, keyboard, key, is_pressed, int_coord):
         if is_pressed:
-            self.last_key = str(key)
+            s = str(key)
+            self.last_key = s if len(s) <= 16 else (s[:15] + "…")
         return key
 
-    def _active_layer(self, keyboard):
-        if hasattr(keyboard, "active_layers") and keyboard.active_layers:
-            return keyboard.active_layers[0]
-        if hasattr(keyboard, "_state") and keyboard._state and keyboard._state.active_layers:
-            return keyboard._state.active_layers[0]
-        return 0
-
-    def _draw(self, force=False):
+    def _draw(self, keyboard, force=False):
         if self.oled is None:
             return
 
         now = time.monotonic()
-        if not force and (now - self._last_draw) < 0.25:
+        if not force and (now - self._last_draw) < 0.20:
             return
-        self._last_draw = now
 
-        layer = self._active_layer(keyboard)
-        mode = "BASE" if layer == 0 else "BROWSER"
+        layer = self._active_layer_from_keyboard(keyboard)
+        mode = "BASE" if layer == 0 else f"L{layer}"
 
         info = self.bl.info() if self.bl else {}
         theme = info.get("theme", 0)
         eff = info.get("effect", "static")
         bri = info.get("brightness", 0.0)
 
+        state = (mode, theme, eff, round(float(bri), 2), self.last_key)
+        if not force and state == self._last_state:
+            return
+
+        self._last_state = state
+        self._last_draw = now
+
         self.oled.fill(0)
         self.oled.text("TheusHen", 0, 0, 1)
-        self.oled.text(f"Mode: {mode}", 0, 10, 1)
-        self.oled.text(f"BL t{theme} {eff} b{bri:.2f}", 0, 20, 1)
-        if self.h >= 64:
-            self.oled.text(f"Last: {self.last_key[:18]}", 0, 30, 1)
+        self.oled.text(f"Mode: {mode}", 0, 8, 1)
+        self.oled.text(f"BL t{theme} {eff[:4]} b{bri:.2f}", 0, 16, 1)
+        self.oled.text(f"Last: {self.last_key}", 0, 24, 1)
         self.oled.show()
 
 
+# ----------------------------
+# KMK setup
+# ----------------------------
 keyboard = KMKKeyboard()
 
 keyboard.matrix = KeysScanner(
@@ -345,7 +411,9 @@ keyboard.modules.append(backlight)
 oled = OLEDStatus(I2C_SDA, I2C_SCL, addr=OLED_ADDR, w=OLED_W, h=OLED_H, bl=backlight)
 keyboard.modules.append(oled)
 
-
+# ----------------------------
+# Key behavior (unchanged)
+# ----------------------------
 OS_LALT = KC.OS(KC.LALT, tap_time=None)
 
 K_B1 = KC.HT(
@@ -377,10 +445,6 @@ K_B4 = KC.HT(
     kc_print_screen(),          # segurar: PrintScreen
 )
 
-# Combos:
-# - B3+B4: troca tema de cor dos LEDs (debaixo das teclas)
-# - B2+B3+B4: troca efeito (static/breathe/rainbow)
-# - B1+B4: troca brilho (low/med/high)
 combos.combos = [
     Chord((K_B1, K_B2), KC.LALT(KC.TAB), timeout=180),
     Chord((K_B1, K_B2, K_B3), KC.LALT(KC.LSFT(KC.TAB)), timeout=220),

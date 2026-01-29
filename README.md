@@ -15,11 +15,11 @@ A compact, four-key Hackpad built around the Seeed XIAO RP2040 with six SK6812 M
 ![3D_PCB](assets/3d_pcb.png)
 
 ### Case Fit
-### Being Updated..
+![3D_CASE](./assets/3d_case.png)
 
 ## BOM (Bill of Materials)
 
-### Being Updated..
+Download and run locally: [TheusHen/TheusHenHackpad/blob/main/BOM/ibom.html](https://github.com/TheusHen/TheusHenHackpad/blob/main/BOM/ibom.html)
 
 ## Notes
 
