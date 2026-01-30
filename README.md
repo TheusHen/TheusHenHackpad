@@ -4,6 +4,9 @@ A compact, four-key Hackpad built around the Seeed XIAO RP2040 with six SK6812 M
 
 ## Screenshots
 
+## 3D Assembly
+![Assembly 1](assets/assembly1.png)
+![Assembly 2](assets/assembly2.png)
 
 ### Schematic
 ![Schematic](assets/sch.png)
